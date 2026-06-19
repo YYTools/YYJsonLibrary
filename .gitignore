@@ -1,0 +1,24 @@
+# ignore test project
+/YYJsonLibraryTests/
+
+# Build outputs
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+# Package folders
+/packages/
+
+# User-specific / IDE settings and files
+.idea/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.DotSettings.user
+riderModule.iml
+/_ReSharper.Caches/
+.DS_Store
