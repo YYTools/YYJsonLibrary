@@ -31,7 +31,10 @@ public static class YYDeserializer
         options.PolymorphicTypeResolver ??= (baseType, obj) => 
         {
             string? classTag = obj.Properties.Keys.FirstOrDefault(k => k.StartsWith('$'));
-            if (classTag is null) return null;
+            if (classTag is null)
+            {
+                return null;
+            }
             
             string className = classTag.Substring(1);
             Type? resolvedType = ResolveType(className);
