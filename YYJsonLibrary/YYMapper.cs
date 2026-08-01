@@ -8,6 +8,31 @@ namespace YYJsonLibrary;
 public static class YYMapper
 {
     private static ConcurrentDictionary<Type, PropertyInfo[]> _propertyCache = new();
+    private static readonly NullabilityInfoContext _nullabilityContext = new();
+
+    private static bool IsNullableString(PropertyInfo prop)
+    {
+        if (prop.PropertyType != typeof(string))
+        {
+            return false;
+        }
+
+        // treat %Name as special (force empty string instead of null)
+        if (prop.Name == "%Name")
+        {
+            return false;
+        }
+
+        try
+        {
+            var info = _nullabilityContext.Create(prop);
+            return info.WriteState == NullabilityState.Nullable;
+        }
+        catch
+        {
+            return true;
+        }
+    }
 
     public static YYValue MapValue(object? obj, YYOptions options)
     {
@@ -47,7 +72,7 @@ public static class YYMapper
         // dictionary
         if (obj is IDictionary dict)
         {
-            YYObject yyDictObj = new();
+            YYObject yyDictObj = new() { IsDictionary = true };
             foreach (DictionaryEntry entry in dict) // cant do KeyValuePair here
             {
                 yyDictObj.Properties[entry.Key.ToString()!] = MapValue(entry.Value, options);
@@ -87,6 +112,7 @@ public static class YYMapper
             PropertyInfo? versionProp = properties.FirstOrDefault(p => p.Name == options.GMVersionPropertyName);
             PropertyInfo? nameProp = properties.FirstOrDefault(p => p.Name == options.GMNamePropertyName);
             
+            
             if (versionProp is not null && (options.ShouldIgnoreProperty is null || !options.ShouldIgnoreProperty(versionProp))) 
             {
                 object? versionVal = versionProp.GetValue(obj);
@@ -94,6 +120,7 @@ public static class YYMapper
                 {
                     versionVal = options.GMVersionFallbackResolver(type);
                 }
+                
                 yyObject.Properties[$"${GetGameMakerTypeName(type)}"] = MapValue(versionVal, options);
             }
             
@@ -105,9 +132,14 @@ public static class YYMapper
                     nameVal = options.GMNameFallbackResolver(obj);
                 }
 
-                YYValue nameValue = MapValue(nameVal, options);
-                // if name is null, then return empty string in place
-                yyObject.Properties["%Name"] = (nameValue.GetType() == typeof(YYNull)) ? new YYString(string.Empty) : nameValue;
+                // check if name is null and we should ignore it
+                bool ignoreNull = nameVal is null && options.IgnoreWhenWritingNullResolver is not null && options.IgnoreWhenWritingNullResolver(nameProp);
+
+                if (!ignoreNull)
+                {
+                    YYValue nameValue = MapValue(nameVal, options);
+                    yyObject.Properties["%Name"] = (nameValue.GetType() == typeof(YYNull)) ? new YYString(string.Empty) : nameValue;
+                }
             }
         }
         
@@ -146,7 +178,14 @@ public static class YYMapper
             }
 
             // recursively map
-            yyObject.Properties[finalKeyName] = MapValue(rawValue, options);
+            if (rawValue is null && prop.PropertyType == typeof(string) && !IsNullableString(prop))
+            {
+                yyObject.Properties[finalKeyName] = new YYString(string.Empty);
+            }
+            else
+            {
+                yyObject.Properties[finalKeyName] = MapValue(rawValue, options);
+            }
         }
         
         return yyObject;

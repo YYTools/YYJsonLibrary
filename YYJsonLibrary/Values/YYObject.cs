@@ -5,6 +5,7 @@ namespace YYJsonLibrary;
 public class YYObject : YYValue
 {
     public Dictionary<string, YYValue> Properties = new();
+    public bool IsDictionary { get; set; } = false;
     
     public override void Write(YYWriter writer, int depth, bool inArray)
     {
@@ -23,25 +24,40 @@ public class YYObject : YYValue
             .ThenBy(k => k) // alphabetical
             .ToList();
         
-        // iterate through the combined list
-        foreach (string key in sortedKeys)
+        if (IsDictionary)
         {
-            if (!inArray)
+            foreach (string key in sortedKeys)
             {
                 writer.AppendIndent(innerDepth);
+                writer.AppendInQuotes(key);
+                writer.Append(':');
+                Properties[key].Write(writer, innerDepth, true);
+                writer.Append(',');
+            }
+            writer.AppendIndent(depth);
+        }
+        else
+        {
+            // iterate through the combined list
+            foreach (string key in sortedKeys)
+            {
+                if (!inArray)
+                {
+                    writer.AppendIndent(innerDepth);
+                }
+                
+                writer.AppendInQuotes(key);
+                writer.Append(':');
+                
+                Properties[key].Write(writer, innerDepth, inArray);
+                
+                writer.Append(',');
             }
             
-            writer.AppendInQuotes(key);
-            writer.Append(':');
-            
-            Properties[key].Write(writer, innerDepth, inArray);
-            
-            writer.Append(',');
-        }
-        
-        if (!inArray)
-        {
-            writer.AppendIndent(depth);
+            if (!inArray)
+            {
+                writer.AppendIndent(depth);
+            }
         }
         
         writer.Append('}');
