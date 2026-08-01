@@ -21,7 +21,7 @@ public class YYObject : YYValue
         var sortedKeys = Properties.Keys
             .OrderByDescending(k => k.StartsWith('$')) // $ tags first
             .ThenByDescending(k => k.StartsWith('%')) // % tags second
-            .ThenBy(k => k) // alphabetical
+            .ThenBy(k => k, StringComparer.OrdinalIgnoreCase) // alphabetical
             .ToList();
         
         if (IsDictionary)
