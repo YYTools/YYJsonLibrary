@@ -87,14 +87,27 @@ public static class YYMapper
             PropertyInfo? versionProp = properties.FirstOrDefault(p => p.Name == options.GMVersionPropertyName);
             PropertyInfo? nameProp = properties.FirstOrDefault(p => p.Name == options.GMNamePropertyName);
             
-            if (versionProp is not null) 
+            if (versionProp is not null && (options.ShouldIgnoreProperty is null || !options.ShouldIgnoreProperty(versionProp))) 
             {
-                yyObject.Properties[$"${GetGameMakerTypeName(type)}"] = MapValue(versionProp.GetValue(obj), options);
+                object? versionVal = versionProp.GetValue(obj);
+                if ((versionVal is null || (versionVal is string strVal && string.IsNullOrWhiteSpace(strVal))) && options.GMVersionFallbackResolver is not null)
+                {
+                    versionVal = options.GMVersionFallbackResolver(type);
+                }
+                yyObject.Properties[$"${GetGameMakerTypeName(type)}"] = MapValue(versionVal, options);
             }
             
-            if (nameProp is not null) 
+            if (nameProp is not null && (options.ShouldIgnoreProperty is null || !options.ShouldIgnoreProperty(nameProp))) 
             {
-                yyObject.Properties["%Name"] = MapValue(nameProp.GetValue(obj), options);
+                object? nameVal = nameProp.GetValue(obj);
+                if ((nameVal is null || (nameVal is string strVal && string.IsNullOrWhiteSpace(strVal))) && options.GMNameFallbackResolver is not null)
+                {
+                    nameVal = options.GMNameFallbackResolver(obj);
+                }
+
+                YYValue nameValue = MapValue(nameVal, options);
+                // if name is null, then return empty string in place
+                yyObject.Properties["%Name"] = (nameValue.GetType() == typeof(YYNull)) ? new YYString(string.Empty) : nameValue;
             }
         }
         
