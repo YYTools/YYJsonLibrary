@@ -1,4 +1,4 @@
-﻿namespace YYJsonLibrary;
+namespace YYJsonLibrary;
 
 public class YYArray : YYValue
 {
