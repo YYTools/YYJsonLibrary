@@ -28,6 +28,6 @@ public class YYWriter
     public void AppendIndent(int indentDepth)
     {
         _sb.Append(Environment.NewLine);
-        _sb.Append(Options.IndentChar, indentDepth * Options.IndentCount);
+        _sb.Append(Options.IndentWithTabs ? '\t' : Options.IndentChar, indentDepth * Options.IndentCount);
     }
 }

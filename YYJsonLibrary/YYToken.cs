@@ -10,6 +10,6 @@ public enum YYToken
     Number,
     Boolean,
     Null,
-    Seperator,
+    Separator,
     Comma
 }

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -5,34 +6,25 @@ namespace YYJsonLibrary;
 
 public ref struct YYParser
 {
-    public YYParser(string json, List<YYTokenData> tokens)
-    {
-        this = new YYParser(json, CollectionsMarshal.AsSpan(tokens));
-    }
-    public YYParser(string json, ReadOnlySpan<YYTokenData> tokens)
-    {
-        this = new YYParser(json.AsSpan(), tokens);
-    }
-    public YYParser(ReadOnlySpan<char> json, List<YYTokenData> tokens)
-    {
-        this = new YYParser(json, CollectionsMarshal.AsSpan(tokens));
-    }
-    public YYParser(ReadOnlySpan<char> json, ReadOnlySpan<YYTokenData> tokens)
-    {
-        _tokens = tokens;
-        _json = json;
-        _index = 0;
-        _stringPool = new();
-    }
-
     private ReadOnlySpan<char> _json;
-    private ReadOnlySpan<YYTokenData> _tokens;
-    private int _index;
+    private YYTokenizer _tokenizer;
+    private YYTokenData _current;
+    private bool _hasToken;
     private HashSet<string> _stringPool;
+    
+    public YYParser(string json) : this(json.AsSpan()) { }
+
+    public YYParser(ReadOnlySpan<char> json)
+    {
+        _json = json;
+        _tokenizer = new YYTokenizer(json);
+        _stringPool = new HashSet<string>();
+        _hasToken = _tokenizer.NextToken(out _current);
+    }
     
     public YYValue? Parse()
     {
-        if (_tokens.Length == 0)
+        if (!_hasToken)
         {
             return null;
         }
@@ -42,7 +34,12 @@ public ref struct YYParser
 
     private YYValue ParseValue()
     {
-        YYTokenData token = _tokens[_index];
+        if (!_hasToken)
+        {
+            throw new FormatException("Unexpected EOF while expecting a value.");
+        }
+        
+        YYTokenData token = _current;
         
         switch (token.Token)
         {
@@ -71,36 +68,33 @@ public ref struct YYParser
         YYObject obj = new();
         Step(); // consume the bracket
         
-        while (_index < _tokens.Length)
+        while (_hasToken)
         {
-            YYTokenData token = _tokens[_index];
-            
-            if (token.Token == YYToken.EndObject)
+            if (_current.Token == YYToken.EndObject)
             {
                 Step();
                 return obj;
             }
             
-            if (token.Token != YYToken.String)
+            if (_current.Token != YYToken.String)
             {
-                throw new FormatException("Expected string token at position " + token.Position);
+                throw new FormatException("Expected string token at position " + _current.Position);
             }
             
-            string key = GetPooledString(token.Position, token.Length);    
+            string key = GetPooledString(_current.Position, _current.Length);    
             Step();
-            
-            token = _tokens[_index];
-            if (token.Token != YYToken.Seperator)
-            {
-                throw new FormatException("Expected seperator at position " + token.Position);
-            }
 
+            if (!_hasToken || _current.Token != YYToken.Separator)
+            {
+                throw new FormatException($"Expected ':' separator after key '{key}'");
+            }
+            
             Step();
             
-            obj.Properties.Add(key, ParseValue());
+            obj.Properties[key] = ParseValue();
             
             // skip commas
-            if (_index < _tokens.Length && _tokens[_index].Token == YYToken.Comma)
+            if (_hasToken && _current.Token == YYToken.Comma)
             {
                 Step();
             }
@@ -114,11 +108,9 @@ public ref struct YYParser
         YYArray array = new();
         Step(); // consume bracket
         
-        while (_index < _tokens.Length)
+        while (_hasToken)
         {
-            YYTokenData token = _tokens[_index];
-
-            if (token.Token == YYToken.EndArray)
+            if (_current.Token == YYToken.EndArray)
             {
                 Step();
                 return array;
@@ -126,7 +118,7 @@ public ref struct YYParser
             array.Items.Add(ParseValue());
             
             // skip commas
-            if (_index < _tokens.Length && _tokens[_index].Token == YYToken.Comma)
+            if (_hasToken && _current.Token == YYToken.Comma)
             {
                 Step();
             }
@@ -136,24 +128,21 @@ public ref struct YYParser
 
     private YYValue ParseString(YYTokenData token)
     {
-        string str = GetString(token.Position, token.Length);
-        
-        return new YYString(str);
+        return new YYString(GetString(token.Position, token.Length));
     }
 
     private YYValue ParseBool(YYTokenData token)
     {
         ReadOnlySpan<char> span = _json.Slice(token.Position, token.Length);
-
-        bool value = span.SequenceEqual("true");
-        return new YYBool(value);
+        
+        return new YYBool(span.SequenceEqual("true"));
     }
 
     private YYValue ParseNumber(YYTokenData token)
     {
         ReadOnlySpan<char> span = _json.Slice(token.Position, token.Length);
         
-        if (double.TryParse(span, out double value))
+        if (double.TryParse(span, NumberStyles.Float, CultureInfo.InvariantCulture, out double value))
         {
             bool isFloat = span.Contains('.') || span.Contains('e') || span.Contains('E');
             return new YYNumber(value, isFloat);
@@ -164,19 +153,14 @@ public ref struct YYParser
     
     private void Step()
     {
-        _index++;
+        _hasToken = _tokenizer.NextToken(out _current);
     }
 
     private string GetString(int start, int length)
     {
         ReadOnlySpan<char> span = _json.Slice(start, length);
         
-        if (span.Contains('\\'))
-        {
-            return ProcessEscapeChars(span);
-        }
-        
-        return span.ToString();
+        return (span.Contains('\\')) ? ProcessEscapeChars(span) : span.ToString();
     }
 
     private string GetPooledString(int start, int length)
@@ -245,7 +229,14 @@ public ref struct YYParser
                 case 'n': sb.Append('\n'); break; 
                 case 'r': sb.Append('\r'); break; 
                 case 't': sb.Append('\t'); break;
-                case 'u': throw new NotImplementedException("I really dont want to implement this rn");
+                case 'u': 
+                    if (i + 4 >= rawValue.Length || !ushort.TryParse(rawValue.Slice(i + 1, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ushort hex))
+                    {
+                        throw new FormatException("Invalid unicode escape sequence.");
+                    }
+                    sb.Append((char)hex);
+                    i += 4;
+                    break;
                 default: throw new FormatException("Invalid escape sequence at end of string.");
             }
         }

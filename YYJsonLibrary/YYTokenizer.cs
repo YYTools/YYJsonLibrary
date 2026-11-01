@@ -10,35 +10,44 @@ public ref struct YYTokenizer
     private ReadOnlySpan<char> _span;
     private int _index;
     
+    public bool NextToken(out YYTokenData token)
+    {
+        SkipWhitespace();
+
+        if (_index >= _span.Length)
+        {
+            token = default;
+            return false;
+        }
+
+        char c = _span[_index];
+
+        int position = _index;
+            
+        switch (c)
+        {
+            case '{': token = new (YYToken.StartObject, position, 1); Step(); return true;
+            case '}': token = new(YYToken.EndObject, position, 1); Step(); return true;
+            case '[': token = new(YYToken.StartArray, position, 1); Step(); return true;
+            case ']': token = new(YYToken.EndArray, position, 1); Step(); return true;
+            case ':': token = new(YYToken.Separator, position, 1); Step(); return true;
+            case ',': token = new(YYToken.Comma, position, 1); Step(); return true;
+            case '"': token = new(YYToken.String, position + 1, ReadString()); return true;
+            case '-' or >= '0' and <= '9': token = new(YYToken.Number, position, ReadNumber()); return true;
+            case 't' or 'f': token = new(YYToken.Boolean, position, ReadLiteral(c == 't' ? "true" : "false")); return true;
+            case 'n': token = new(YYToken.Null, position, ReadLiteral("null")); return true;
+            default: throw new FormatException($"Unexpected character '{c}' at position '{position}'");
+        }
+
+    }
+    
     public List<YYTokenData> Tokenize()
     {
         List<YYTokenData> tokens = new(EstimateTokenCount());
 
-        while (_index < _span.Length)
+        while (NextToken(out YYTokenData token))
         {
-            SkipWhitespace();
-            
-            if (_index >= _span.Length) break;
-
-            char c = _span[_index];
-
-            int position = _index;
-            
-            switch (c)
-            {
-                case '{': tokens.Add(new(YYToken.StartObject, position, 1)); Step(); break;
-                case '}': tokens.Add(new(YYToken.EndObject, position, 1)); Step(); break;
-                case '[': tokens.Add(new(YYToken.StartArray, position, 1)); Step(); break;
-                case ']': tokens.Add(new(YYToken.EndArray, position, 1)); Step(); break;
-                case ':': tokens.Add(new(YYToken.Seperator, position, 1)); Step(); break;
-                case ',': tokens.Add(new(YYToken.Comma, position, 1)); Step(); break;
-                case '"': tokens.Add(new(YYToken.String, position + 1, ReadString())); break;
-                case '-' or >= '0' and <= '9': tokens.Add(new(YYToken.Number, position, ReadNumber())); break;
-                case 't' or 'f': tokens.Add(new(YYToken.Boolean, position, ReadLiteral(c == 't' ? "true" : "false"))); break;
-                case 'n': tokens.Add(new(YYToken.Null, position, ReadLiteral("null"))); break;
-                default: throw new FormatException($"Unexpected character '{c}' at position '{position}'");
-            }
-            
+            tokens.Add(token);
         }
         
         return tokens;
@@ -68,6 +77,7 @@ public ref struct YYTokenizer
     
     private int ReadString()
     {
+        // skip opening quote
         Step();
         
         int startIndex = _index;
@@ -79,6 +89,13 @@ public ref struct YYTokenizer
             if (c == '\\')
             {
                 Step();
+                
+                // safety
+                if (_index >= _span.Length)
+                {
+                    throw new FormatException("Unexpected EOF while reading escape sequence in string.");
+                }
+                
                 Step();
                 continue;
             }
@@ -87,7 +104,7 @@ public ref struct YYTokenizer
             {
                 int length = _index - startIndex;
 
-                // skip closing quotes
+                // skip closing quote
                 Step();
 
                 return length;
@@ -107,13 +124,7 @@ public ref struct YYTokenizer
         {
             char c = _span[_index];
             
-            bool isNumber = c switch
-            {
-                >= '0' and <= '9' or '-' or '+' or '.' or 'e' or 'E' => true,
-                _ => false
-            };
-            
-            if (isNumber)
+            if (c is (>= '0' and <= '9') or '-' or '+' or '.' or 'e' or 'E')
             {
                 Step();
                 continue;
@@ -134,17 +145,12 @@ public ref struct YYTokenizer
     }
     
     private void Step() => _index++;
-
-    private char? GetCurrentChar()
-    {
-        return Peek();
-    }
     
     private void SkipWhitespace()
     {
-        while (GetCurrentChar() is char c && char.IsWhiteSpace(c))
+        while (_index < _span.Length && char.IsWhiteSpace(_span[_index]))
         {
-            Step();
+            _index++;
         }
     }
     

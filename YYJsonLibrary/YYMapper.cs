@@ -1,39 +1,61 @@
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
+using System.Globalization;
 using System.Reflection;
 
 namespace YYJsonLibrary;
 
 public static class YYMapper
 {
-    private static ConcurrentDictionary<Type, PropertyInfo[]> _propertyCache = new();
-    private static readonly NullabilityInfoContext _nullabilityContext = new();
-
-    private static bool IsNullableString(PropertyInfo prop)
+    private readonly record struct YYPropertyMetadata(
+        PropertyInfo Property,
+        bool CanRead,
+        bool CanWrite,
+        bool IsNullableString
+    );
+    
+    private static ConcurrentDictionary<Type, YYPropertyMetadata[]> _propertyCache = new();
+    private static readonly ConcurrentDictionary<Type, string> _gmTypeNameCache = new();
+    
+    private static YYPropertyMetadata[] GetTypeMetadata(Type type)
     {
-        if (prop.PropertyType != typeof(string))
+        return _propertyCache.GetOrAdd(type, static t =>
         {
-            return false;
-        }
+            NullabilityInfoContext nullabilityContext = new();
+            PropertyInfo[] rawProps = t.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            YYPropertyMetadata[] metadata = new YYPropertyMetadata[rawProps.Length];
 
-        // treat %Name as special (force empty string instead of null)
-        if (prop.Name == "%Name")
-        {
-            return false;
-        }
+            for (int i = 0; i < rawProps.Length; i++)
+            {
+                PropertyInfo prop = rawProps[i];
+                bool isNullableStr = false;
 
-        try
-        {
-            var info = _nullabilityContext.Create(prop);
-            return info.WriteState == NullabilityState.Nullable;
-        }
-        catch
-        {
-            return true;
-        }
+                if (prop.PropertyType == typeof(string) && prop.Name != "%Name")
+                {
+                    try
+                    {
+                        var info = nullabilityContext.Create(prop);
+                        isNullableStr = info.WriteState == NullabilityState.Nullable;
+                    }
+                    catch
+                    {
+                        isNullableStr = true;
+                    }
+                }
+
+                metadata[i] = new YYPropertyMetadata(
+                    prop,
+                    prop.CanRead,
+                    prop.CanWrite,
+                    isNullableStr
+                );
+            }
+
+            return metadata;
+        });
     }
-
+    
     public static YYValue MapValue(object? obj, YYOptions options)
     {
         if (obj is null)
@@ -73,7 +95,7 @@ public static class YYMapper
         if (obj is IDictionary dict)
         {
             YYObject yyDictObj = new() { IsDictionary = true };
-            foreach (DictionaryEntry entry in dict) // cant do KeyValuePair here
+            foreach (DictionaryEntry entry in dict)
             {
                 yyDictObj.Properties[entry.Key.ToString()!] = MapValue(entry.Value, options);
             }
@@ -93,13 +115,7 @@ public static class YYMapper
         
         // custom objects
         YYObject yyObject = new();
-        
-        // get readable properties
-        PropertyInfo[] properties = _propertyCache.GetOrAdd(type, t => 
-            t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .Where(p => p.CanRead)
-                .ToArray()
-        );
+        YYPropertyMetadata[] properties = GetTypeMetadata(type);
         
         bool isGMResource = options.DoYYFormatting &&
                             options.GMResourceInterface is not null &&
@@ -108,43 +124,68 @@ public static class YYMapper
         // if it inherits the chosen resource base type
         if (isGMResource)
         {
-            // try to find the specific properties for versioning and name
-            PropertyInfo? versionProp = properties.FirstOrDefault(p => p.Name == options.GMVersionPropertyName);
-            PropertyInfo? nameProp = properties.FirstOrDefault(p => p.Name == options.GMNamePropertyName);
-            
-            
-            if (versionProp is not null && (options.ShouldIgnoreProperty is null || !options.ShouldIgnoreProperty(versionProp))) 
+            YYPropertyMetadata? versionMeta = null;
+            YYPropertyMetadata? nameMeta = null;
+
+            foreach (var meta in properties)
+            {
+                if (!meta.CanRead)
+                {
+                    continue;
+                }
+
+                if (meta.Property.Name == options.GMVersionPropertyName)
+                {
+                    versionMeta = meta;
+                }
+                else if (meta.Property.Name == options.GMNamePropertyName)
+                {
+                    nameMeta = meta;
+                }
+            }
+
+            if (versionMeta is { Property: PropertyInfo versionProp } &&
+                (options.ShouldIgnoreProperty is null || !options.ShouldIgnoreProperty(versionProp)))
             {
                 object? versionVal = versionProp.GetValue(obj);
-                if ((versionVal is null || (versionVal is string strVal && string.IsNullOrWhiteSpace(strVal))) && options.GMVersionFallbackResolver is not null)
+                if ((versionVal is null || (versionVal is string strVal && string.IsNullOrWhiteSpace(strVal))) &&
+                    options.GMVersionFallbackResolver is not null)
                 {
                     versionVal = options.GMVersionFallbackResolver(type);
                 }
-                
+
                 yyObject.Properties[$"${GetGameMakerTypeName(type)}"] = MapValue(versionVal, options);
             }
-            
-            if (nameProp is not null && (options.ShouldIgnoreProperty is null || !options.ShouldIgnoreProperty(nameProp))) 
+
+            if (nameMeta is { Property: PropertyInfo nameProp } &&
+                (options.ShouldIgnoreProperty is null || !options.ShouldIgnoreProperty(nameProp)))
             {
                 object? nameVal = nameProp.GetValue(obj);
-                if ((nameVal is null || (nameVal is string strVal && string.IsNullOrWhiteSpace(strVal))) && options.GMNameFallbackResolver is not null)
+                if ((nameVal is null || (nameVal is string strVal && string.IsNullOrWhiteSpace(strVal))) &&
+                    options.GMNameFallbackResolver is not null)
                 {
                     nameVal = options.GMNameFallbackResolver(obj);
                 }
 
-                // check if name is null and we should ignore it
-                bool ignoreNull = nameVal is null && options.IgnoreWhenWritingNullResolver is not null && options.IgnoreWhenWritingNullResolver(nameProp);
-
+                bool ignoreNull = nameVal is null && options.IgnoreWhenWritingNullResolver is not null &&
+                                  options.IgnoreWhenWritingNullResolver(nameProp);
                 if (!ignoreNull)
                 {
                     YYValue nameValue = MapValue(nameVal, options);
-                    yyObject.Properties["%Name"] = (nameValue.GetType() == typeof(YYNull)) ? new YYString(string.Empty) : nameValue;
+                    yyObject.Properties["%Name"] = nameValue is YYNull ? new YYString(string.Empty) : nameValue;
                 }
             }
         }
-        
-        foreach (PropertyInfo prop in properties)
+
+        foreach (YYPropertyMetadata meta in properties)
         {
+            if (!meta.CanRead)
+            {
+                continue;
+            }
+            
+            PropertyInfo prop = meta.Property;
+            
             // skip the resource base
             if (isGMResource && (prop.Name == options.GMVersionPropertyName || prop.Name == options.GMNamePropertyName))
             {
@@ -178,7 +219,7 @@ public static class YYMapper
             }
 
             // recursively map
-            if (rawValue is null && prop.PropertyType == typeof(string) && !IsNullableString(prop))
+            if (rawValue is null && prop.PropertyType == typeof(string) && meta.IsNullableString)
             {
                 yyObject.Properties[finalKeyName] = new YYString(string.Empty);
             }
@@ -198,6 +239,8 @@ public static class YYMapper
 
     public static object? Unmap(YYValue node, Type targetType, YYOptions options)
     {
+        Type effectiveType = Nullable.GetUnderlyingType(targetType) ?? targetType;
+        
         // null
         if (node is YYNull)
         {
@@ -205,13 +248,13 @@ public static class YYMapper
         }
 
         // string
-        if (node is YYString yyStr && targetType == typeof(string))
+        if (node is YYString yyStr && effectiveType == typeof(string))
         {
             return yyStr.Value;
         }
 
         // bool
-        if (node is YYBool yyBool && targetType == typeof(bool))
+        if (node is YYBool yyBool && effectiveType == typeof(bool))
         {
             return yyBool.Value;
         }
@@ -219,21 +262,20 @@ public static class YYMapper
         // number
         if (node is YYNumber yyNum)
         {
-            if (targetType.IsEnum)
+            if (effectiveType.IsEnum)
             {
-                return Enum.ToObject(targetType, Convert.ToInt64(yyNum.Value));
+                return Enum.ToObject(effectiveType, Convert.ToInt64(yyNum.Value));
             }
 
-            return Convert.ChangeType(yyNum.Value, targetType, System.Globalization.CultureInfo.InvariantCulture);
+            return Convert.ChangeType(yyNum.Value, effectiveType, System.Globalization.CultureInfo.InvariantCulture);
         }
 
-        // array/list
-        if (node is YYArray arr && typeof(IEnumerable).IsAssignableFrom(targetType) && targetType != typeof(string))
+        // array/list/hashset
+        if (node is YYArray arr && typeof(IEnumerable).IsAssignableFrom(effectiveType) && effectiveType != typeof(string))
         {
-            // true arrays
-            if (targetType.IsArray)
+            if (effectiveType.IsArray)
             {
-                Type elementType = targetType.GetElementType()!;
+                Type elementType = effectiveType.GetElementType()!;
                 Array array = Array.CreateInstance(elementType, arr.Items.Count);
 
                 for (int i = 0; i < arr.Items.Count; i++)
@@ -245,30 +287,31 @@ public static class YYMapper
             }
 
             // lists and other collections
-            if (targetType.IsGenericType)
+            if (effectiveType.IsGenericType)
             {
-                Type genericDefinition = targetType.GetGenericTypeDefinition();
-                Type elementType = targetType.GetGenericArguments()[0];
+                Type genericDefinition = effectiveType.GetGenericTypeDefinition();
+                Type elementType = effectiveType.GetGenericArguments()[0];
                 
-                // if it is a list or we can just treat it like one
-                if (genericDefinition == typeof(List<>) || genericDefinition == typeof(Collection<>) || genericDefinition == typeof(IEnumerable<>) || genericDefinition == typeof(ICollection<>) || genericDefinition == typeof(IList<>))
+                // if it is a list or not we can just treat it like one
+                if (genericDefinition == typeof(List<>) || 
+                    genericDefinition == typeof(Collection<>) || 
+                    genericDefinition == typeof(IEnumerable<>) || 
+                    genericDefinition == typeof(ICollection<>) || 
+                    genericDefinition == typeof(IList<>))
                 {
                     Type listType = typeof(List<>).MakeGenericType(elementType);
                     IList list = (IList)Activator.CreateInstance(listType)!;
-
                     foreach (YYValue itemNode in arr.Items)
                     {
                         list.Add(Unmap(itemNode, elementType, options));
                     }
-
                     return list;
                 }
                 
-                // hashset
                 if (genericDefinition == typeof(HashSet<>))
                 {
-                    object hashSet = Activator.CreateInstance(targetType)!;
-                    MethodInfo addMethod = targetType.GetMethod("Add")!;
+                    object hashSet = Activator.CreateInstance(effectiveType)!;
+                    MethodInfo addMethod = effectiveType.GetMethod("Add")!;
 
                     foreach (YYValue itemNode in arr.Items)
                     {
@@ -281,24 +324,19 @@ public static class YYMapper
         }
         
         // dictionary
-        if (node is YYObject dictObj && targetType.IsGenericType && targetType.GetGenericTypeDefinition() == typeof(Dictionary<,>))
+        if (node is YYObject dictObj && effectiveType.IsGenericType && effectiveType.GetGenericTypeDefinition() == typeof(Dictionary<,>))
         {
-            Type keyType = targetType.GetGenericArguments()[0]; // TKey
-            Type valueType = targetType.GetGenericArguments()[1]; // TValue
-            IDictionary dict = (IDictionary)Activator.CreateInstance(targetType)!;
+            Type keyType = effectiveType.GetGenericArguments()[0]; // TKey
+            Type valueType = effectiveType.GetGenericArguments()[1]; // TValue
+            
+            IDictionary dict = (IDictionary)Activator.CreateInstance(effectiveType)!;
 
             foreach (var kvp in dictObj.Properties)
             {
                 // convert the key
-                object convertedKey;
-                if (keyType.IsEnum)
-                {
-                    convertedKey = Enum.Parse(keyType, kvp.Key, ignoreCase: true);
-                }
-                else
-                {
-                    convertedKey = Convert.ChangeType(kvp.Key, keyType, System.Globalization.CultureInfo.InvariantCulture);
-                }
+                object convertedKey = keyType.IsEnum 
+                    ? Enum.Parse(keyType, kvp.Key, ignoreCase: true) 
+                    : Convert.ChangeType(kvp.Key, keyType, CultureInfo.InvariantCulture);
 
                 // unmap and fix up
                 dict.Add(convertedKey, Unmap(kvp.Value, valueType, options));
@@ -310,12 +348,12 @@ public static class YYMapper
         // object/class
         if (node is YYObject obj)
         {
-            Type actualType = targetType;
+            Type actualType = effectiveType;
 
             // if we have the resolver
             if (options.PolymorphicTypeResolver is not null)
             {
-                Type? resolved = options.PolymorphicTypeResolver(targetType, obj);
+                Type? resolved = options.PolymorphicTypeResolver(effectiveType, obj);
                 if (resolved is not null)
                 {
                     actualType = resolved;
@@ -324,19 +362,22 @@ public static class YYMapper
             
             object instance = Activator.CreateInstance(actualType)!;
             
-            PropertyInfo[] properties = _propertyCache.GetOrAdd(actualType, t => 
-                t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                    .Where(p => p.CanWrite)
-                    .ToArray()
-            );
+            YYPropertyMetadata[] properties = GetTypeMetadata(actualType);
             
             bool isGMResource = options.DoYYFormatting && 
                                 options.GMResourceInterface is not null && 
                                 options.GMResourceInterface.IsAssignableFrom(actualType);
 
             // go through the properties
-            foreach (PropertyInfo prop in properties)
+            foreach (YYPropertyMetadata meta in properties)
             {
+                if (!meta.CanWrite)
+                {
+                    continue;
+                }
+
+                PropertyInfo prop = meta.Property;
+                
                 // the ignore attribute
                 if (options.ShouldIgnoreProperty is not null && options.ShouldIgnoreProperty(prop))
                 {
@@ -375,23 +416,21 @@ public static class YYMapper
         
         throw new InvalidCastException($"cant unmap node {node.GetType().Name} to type {targetType.Name}");
     }
-    
+
     private static string GetGameMakerTypeName(Type type)
     {
-        // if its not a generic type were fine
-        if (!type.IsGenericType)
+        // w anons
+        return _gmTypeNameCache.GetOrAdd(type, static t =>
         {
-            return type.Name;
-        }
-        
-        string baseName = type.Name.Substring(0, type.Name.IndexOf('`'));
-        
-        // the generics
-        Type[] genericArgs = type.GetGenericArguments();
-        
-        // clean them
-        string genericString = string.Join(",", genericArgs.Select(t => GetGameMakerTypeName(t)));
+            if (!t.IsGenericType)
+            {
+                return t.Name;
+            }
 
-        return $"{baseName}<{genericString}>";
+            string baseName = t.Name.Substring(0, t.Name.IndexOf('`'));
+            Type[] genericArgs = t.GetGenericArguments();
+            string genericString = string.Join(",", genericArgs.Select(GetGameMakerTypeName));
+            return $"{baseName}<{genericString}>";
+        });
     }
 }
