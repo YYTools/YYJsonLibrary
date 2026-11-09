@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Reflection;
+using System.Linq.Expressions;
 
 namespace YYJsonLibrary;
 
@@ -10,25 +11,44 @@ public static class YYMapper
 {
     private readonly record struct YYPropertyMetadata(
         PropertyInfo Property,
+        Type EffectiveType,
         bool CanRead,
         bool CanWrite,
-        bool IsNullableString
+        bool IsNullableString,
+        string SerializedName,
+        bool IsIgnored,
+        bool IgnoreWhenWritingNull,
+        Func<object, object?>? Getter,
+        Action<object, object?>? Setter
     );
     
-    private static ConcurrentDictionary<Type, YYPropertyMetadata[]> _propertyCache = new();
+    // cache everything ever
+    private static readonly ConcurrentDictionary<(Type, YYOptions), YYPropertyMetadata[]> _propertyCache = new();
+    // cache the type name
     private static readonly ConcurrentDictionary<Type, string> _gmTypeNameCache = new();
+    // this is to unmap lists effectively
+    private static readonly ConcurrentDictionary<Type, Func<YYArray, YYOptions, object>> _listDeserializerCache = new();
+    // this is to replace the Activator.CreateInstance usages in Unmap
+    private static readonly ConcurrentDictionary<Type, Func<object>> _activatorCache = new();
     
-    private static YYPropertyMetadata[] GetTypeMetadata(Type type)
+    private static YYPropertyMetadata[] GetTypeMetadata(Type type, YYOptions options)
     {
-        return _propertyCache.GetOrAdd(type, static t =>
+        return _propertyCache.GetOrAdd((type, options), static key =>
         {
+            var (t, opt) = key;
             NullabilityInfoContext nullabilityContext = new();
             PropertyInfo[] rawProps = t.GetProperties(BindingFlags.Public | BindingFlags.Instance);
             YYPropertyMetadata[] metadata = new YYPropertyMetadata[rawProps.Length];
-
+            
+            bool isGMResource = opt is { DoYYFormatting: true, GMResourceInterface: not null } &&
+                                opt.GMResourceInterface.IsAssignableFrom(t);
+            
             for (int i = 0; i < rawProps.Length; i++)
             {
                 PropertyInfo prop = rawProps[i];
+                
+                Type effectiveType = Nullable.GetUnderlyingType(prop.PropertyType) ?? prop.PropertyType;
+                
                 bool isNullableStr = false;
 
                 if (prop.PropertyType == typeof(string) && prop.Name != "%Name")
@@ -43,17 +63,125 @@ public static class YYMapper
                         isNullableStr = true;
                     }
                 }
-
+                
+                // resolve and cache the property name
+                string serializedName = prop.Name;
+                if (isGMResource && prop.Name == opt.GMVersionPropertyName)
+                {
+                    serializedName = $"${GetGameMakerTypeName(t)}";
+                }
+                else if (isGMResource && prop.Name == opt.GMNamePropertyName)
+                {
+                    serializedName = "%Name";
+                }
+                else if (opt.PropertyNameResolver is not null)
+                {
+                    string? customName = opt.PropertyNameResolver(prop);
+                    if (!string.IsNullOrWhiteSpace(customName))
+                    {
+                        serializedName = customName;
+                    }
+                }
+                
+                // cache these as well
+                bool isIgnored = opt.ShouldIgnoreProperty?.Invoke(prop) ?? false;
+                bool ignoreWhenNull = opt.IgnoreWhenWritingNullResolver?.Invoke(prop) ?? false;
+                
+                // cache the getters and setters
+                
+                Func<object, object?>? getter = null;
+                if (prop.CanRead)
+                {
+                    var getMethod = prop.GetGetMethod(nonPublic: true);
+                    if (getMethod is not null)
+                    {
+                        getter = (target) => getMethod.Invoke(target, null); 
+                    }
+                }
+                
+                Action<object, object?>? setter = null;
+                if (prop.CanWrite)
+                {
+                    var setMethod = prop.GetSetMethod(nonPublic: true);
+                    if (setMethod is not null)
+                    {
+                        setter = (target, val) => setMethod.Invoke(target, new[] { val });
+                    }
+                }
+                
                 metadata[i] = new YYPropertyMetadata(
                     prop,
+                    effectiveType,
                     prop.CanRead,
                     prop.CanWrite,
-                    isNullableStr
+                    isNullableStr,
+                    serializedName,
+                    isIgnored,
+                    ignoreWhenNull,
+                    getter,
+                    setter
                 );
             }
-
+            
+            // sort everything alphabetically
+            Array.Sort(metadata, static (a, b) =>
+            {
+                // $ tag first
+                bool aDollar = a.SerializedName.StartsWith('$');
+                bool bDollar = b.SerializedName.StartsWith('$');
+                if (aDollar != bDollar)
+                {
+                    return aDollar ? -1 : 1;
+                }
+                
+                // % tag second
+                bool aPercent = a.SerializedName.StartsWith('%');
+                bool bPercent = b.SerializedName.StartsWith('%');
+                if (aPercent != bPercent)
+                {
+                    return aPercent ? -1 : 1;
+                }
+                
+                // alphabetical
+                return string.Compare(a.SerializedName, b.SerializedName, StringComparison.OrdinalIgnoreCase);
+            });
+            
             return metadata;
         });
+    }
+    
+    /// <summary>
+    /// Unmaps a list effectively
+    /// </summary>
+    private static object UnmapListGeneric<TElement>(YYArray arr, YYOptions options)
+    {
+        List<TElement> list = new(arr.Items.Count);
+        for (int i = 0; i < arr.Items.Count; i++)
+        {
+            list.Add(Unmap<TElement>(arr.Items[i], options)!);
+        }
+        return list;
+    }
+    
+    /// <summary>
+    /// Replaces Activator.CreateInstance by caching anonymous functions which create the correct type
+    /// </summary>
+    private static object CreateInstanceFast(Type type)
+    {
+        // get or compile the factory
+        Func<object> factory = _activatorCache.GetOrAdd(type, static t =>
+        {
+            /*
+                I dont really understand this
+                but apparently it creates a function equivalent to
+                `() => new Type()` which is faster!
+            */
+            var newExpression = Expression.New(t);
+            var lambda = Expression.Lambda<Func<object>>(newExpression);
+            return lambda.Compile();
+        });
+        // execute it and return it
+        return factory();
     }
     
     public static YYValue MapValue(object? obj, YYOptions options)
@@ -116,7 +244,7 @@ public static class YYMapper
         
         // custom objects
         YYObject yyObject = new();
-        YYPropertyMetadata[] properties = GetTypeMetadata(type);
+        YYPropertyMetadata[] properties = GetTypeMetadata(type, options);
         
         bool isGMResource = options.DoYYFormatting &&
                             options.GMResourceInterface is not null &&
@@ -180,7 +308,7 @@ public static class YYMapper
 
         foreach (YYPropertyMetadata meta in properties)
         {
-            if (!meta.CanRead)
+            if (!meta.CanRead || meta.IsIgnored)
             {
                 continue;
             }
@@ -193,40 +321,21 @@ public static class YYMapper
                 continue;
             }
             
-            // the ignore attribute
-            if (options.ShouldIgnoreProperty is not null && options.ShouldIgnoreProperty(prop))
+            object? rawValue = meta.Getter!(obj);
+            
+            // ignore when null
+            if (rawValue is null && meta.IgnoreWhenWritingNull)
             {
                 continue;
             }
             
-            object? rawValue = prop.GetValue(obj);
-            
-            if (rawValue is null && options.IgnoreWhenWritingNullResolver is not null && options.IgnoreWhenWritingNullResolver(prop))
-            {
-                continue;
-            }
-            
-            string finalKeyName = prop.Name;
-            
-            // run the property name resolver
-            if (options.PropertyNameResolver is not null)
-            {
-                string? customName = options.PropertyNameResolver(prop);
-                
-                if (!string.IsNullOrWhiteSpace(customName))
-                {
-                    finalKeyName = customName;
-                }
-            }
-
-            // recursively map
             if (rawValue is null && prop.PropertyType == typeof(string) && meta.IsNullableString)
             {
-                yyObject.Properties[finalKeyName] = new YYString(string.Empty);
+                yyObject.Properties[meta.SerializedName] = new YYString(string.Empty);
             }
             else
             {
-                yyObject.Properties[finalKeyName] = MapValue(rawValue, options);
+                yyObject.Properties[meta.SerializedName] = MapValue(rawValue, options);
             }
         }
         
@@ -263,9 +372,34 @@ public static class YYMapper
         // number
         if (node is YYNumber yyNum)
         {
+            if (effectiveType == typeof(int))
+            {
+                return (int)yyNum.Value;
+            }
+
+            if (effectiveType == typeof(uint))
+            {
+                return (uint)yyNum.Value;
+            }
+
+            if (effectiveType == typeof(float))
+            {
+                return (float)yyNum.Value;
+            }
+
+            if (effectiveType == typeof(double))
+            {
+                return yyNum.Value;
+            }
+
+            if (effectiveType == typeof(bool))
+            {
+                return yyNum.Value != 0;
+            }
+            
             if (effectiveType.IsEnum)
             {
-                return Enum.ToObject(effectiveType, Convert.ToInt64(yyNum.Value));
+                return Enum.ToObject(effectiveType, BitConverter.DoubleToInt64Bits(yyNum.Value));
             }
 
             return Convert.ChangeType(yyNum.Value, effectiveType, System.Globalization.CultureInfo.InvariantCulture);
@@ -290,6 +424,7 @@ public static class YYMapper
             // lists and other collections
             if (effectiveType.IsGenericType)
             {
+                // HERE
                 Type genericDefinition = effectiveType.GetGenericTypeDefinition();
                 Type elementType = effectiveType.GetGenericArguments()[0];
                 
@@ -300,18 +435,24 @@ public static class YYMapper
                     genericDefinition == typeof(ICollection<>) || 
                     genericDefinition == typeof(IList<>))
                 {
-                    Type listType = typeof(List<>).MakeGenericType(elementType);
-                    IList list = (IList)Activator.CreateInstance(listType)!;
-                    foreach (YYValue itemNode in arr.Items)
+                    // find from cache or make
+                    var unmapper = _listDeserializerCache.GetOrAdd(elementType, static elemType =>
                     {
-                        list.Add(Unmap(itemNode, elementType, options));
-                    }
-                    return list;
+                        // get UnmapListGeneric and get that generic
+                        var method = typeof(YYMapper)
+                            .GetMethod(nameof(UnmapListGeneric), BindingFlags.NonPublic | BindingFlags.Static)!
+                            .MakeGenericMethod(elemType);
+                        // create a delegate with that method
+                        return (Func<YYArray, YYOptions, object>)Delegate.CreateDelegate(
+                            typeof(Func<YYArray, YYOptions, object>), method);
+                    });
+                    
+                    return unmapper(arr, options);
                 }
                 
                 if (genericDefinition == typeof(HashSet<>))
                 {
-                    object hashSet = Activator.CreateInstance(effectiveType)!;
+                    object hashSet = CreateInstanceFast(effectiveType)!;
                     MethodInfo addMethod = effectiveType.GetMethod("Add")!;
 
                     foreach (YYValue itemNode in arr.Items)
@@ -330,7 +471,7 @@ public static class YYMapper
             Type keyType = effectiveType.GetGenericArguments()[0]; // TKey
             Type valueType = effectiveType.GetGenericArguments()[1]; // TValue
             
-            IDictionary dict = (IDictionary)Activator.CreateInstance(effectiveType)!;
+            IDictionary dict = (IDictionary)CreateInstanceFast(effectiveType)!;
 
             foreach (var kvp in dictObj.Properties)
             {
@@ -361,54 +502,22 @@ public static class YYMapper
                 }
             }
             
-            object instance = Activator.CreateInstance(actualType)!;
+            object instance = CreateInstanceFast(actualType)!;
             
-            YYPropertyMetadata[] properties = GetTypeMetadata(actualType);
-            
-            bool isGMResource = options.DoYYFormatting && 
-                                options.GMResourceInterface is not null && 
-                                options.GMResourceInterface.IsAssignableFrom(actualType);
+            YYPropertyMetadata[] properties = GetTypeMetadata(actualType, options);
 
             // go through the properties
             foreach (YYPropertyMetadata meta in properties)
             {
-                if (!meta.CanWrite)
+                if (!meta.CanWrite || meta.IsIgnored)
                 {
                     continue;
                 }
-
-                PropertyInfo prop = meta.Property;
                 
-                // the ignore attribute
-                if (options.ShouldIgnoreProperty is not null && options.ShouldIgnoreProperty(prop))
+                if (obj.Properties.TryGetValue(meta.SerializedName, out YYValue? childNode))
                 {
-                    continue;
-                }
-
-                string jsonKeyName = prop.Name;
-                
-                if (isGMResource && prop.Name == options.GMVersionPropertyName)
-                {
-                    jsonKeyName = $"${GetGameMakerTypeName(actualType)}";
-                }
-                else if (isGMResource && prop.Name == options.GMNamePropertyName)
-                {
-                    jsonKeyName = "%Name";    
-                }
-                else if (options.PropertyNameResolver is not null)
-                {
-                    // then use the resolver to find the custom name
-                    string? customName = options.PropertyNameResolver(prop);
-                    if (!string.IsNullOrWhiteSpace(customName))
-                    {
-                        jsonKeyName = customName;
-                    }
-                }
-                
-                if (obj.Properties.TryGetValue(jsonKeyName, out YYValue? childNode))
-                {
-                    object? deserializedValue = Unmap(childNode, prop.PropertyType, options);
-                    prop.SetValue(instance, deserializedValue);
+                    object? deserializedValue = Unmap(childNode, meta.EffectiveType, options);
+                    meta.Setter!(instance, deserializedValue);
                 }
             }
             

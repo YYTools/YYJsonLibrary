@@ -17,21 +17,15 @@ public class YYObject : YYValue
         
         writer.Append('{');
         int innerDepth = depth + 1;
-
-        var sortedKeys = Properties.Keys
-            .OrderByDescending(k => k.StartsWith('$')) // $ tags first
-            .ThenByDescending(k => k.StartsWith('%')) // % tags second
-            .ThenBy(k => k, StringComparer.OrdinalIgnoreCase) // alphabetical
-            .ToList();
         
         if (IsDictionary)
         {
-            foreach (string key in sortedKeys)
+            foreach (var (key, value) in Properties)
             {
                 writer.AppendIndent(innerDepth);
                 writer.AppendInQuotes(key);
                 writer.Append(':');
-                Properties[key].Write(writer, innerDepth, true);
+                value.Write(writer, innerDepth, true);
                 writer.Append(',');
             }
             writer.AppendIndent(depth);
@@ -39,7 +33,7 @@ public class YYObject : YYValue
         else
         {
             // iterate through the combined list
-            foreach (string key in sortedKeys)
+            foreach (var (key, val) in Properties)
             {
                 if (!inArray)
                 {
@@ -49,7 +43,7 @@ public class YYObject : YYValue
                 writer.AppendInQuotes(key);
                 writer.Append(':');
                 
-                Properties[key].Write(writer, innerDepth, inArray);
+                val.Write(writer, innerDepth, inArray);
                 
                 writer.Append(',');
             }
