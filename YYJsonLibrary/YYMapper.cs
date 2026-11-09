@@ -79,11 +79,12 @@ public static class YYMapper
                 return new YYNumber(d, true);
             case decimal dec:
                 return new YYNumber(Convert.ToDouble(dec), true);
-            case sbyte or byte or short or ushort or int or uint or long or ulong: 
+            case sbyte or byte or short or ushort or int or uint:
                 return new YYNumber(Convert.ToDouble(obj), false);
-            case Enum e: 
-                return new YYNumber(Convert.ToDouble(e), false);
-            
+            case long or ulong:
+                return new YYNumber(Convert.ToDouble(obj), false, obj.ToString());
+            case Enum e:
+                return new YYNumber(Convert.ToDouble(e), false, e.ToString("d")); // "d" makes it so it doesnt do scientific notation
             // safeguards for reflection
             case Type t: 
                 return new YYString(t.Name); 

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 
 namespace YYJsonLibrary;
@@ -6,21 +7,26 @@ public class YYNumber : YYValue
 {
     public double Value { get; set; }
     public bool IsFloatingPoint { get; set; }
-    public YYNumber(double value, bool isFloatingPoint) => (Value, IsFloatingPoint) = (value, isFloatingPoint);
+    public string? RawText { get; set; }
+    
+    public YYNumber(double value, bool isFloatingPoint, string? rawText = null)
+    {
+        Value = value;
+        IsFloatingPoint = isFloatingPoint;
+        RawText = rawText;
+    }
 
     public override void Write(YYWriter writer, int depth, bool inArray)
     {
-        string numStr;
+        if (RawText is not null)
+        {
+            writer.Append(RawText);
+            return;
+        }
         
-        // floats that dont contain an actual decimal
-        if (IsFloatingPoint)
-        {
-            numStr = Value.ToString("0.0################", System.Globalization.CultureInfo.InvariantCulture);
-        }
-        else
-        {
-            numStr = Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        }
+        string numStr = IsFloatingPoint
+            ? Value.ToString("0.0################", CultureInfo.InvariantCulture)
+            : Value.ToString("0", CultureInfo.InvariantCulture);
         
         writer.Append(numStr);
     }
